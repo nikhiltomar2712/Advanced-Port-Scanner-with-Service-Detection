@@ -1,31 +1,25 @@
 """
 scanner.py
 ----------
-The actual network probing logic. Three scan strategies are provided:
+Network probing logic with three scan strategies:
 
-  - TCP connect scan (-sT): uses a normal socket.connect(), works
-    everywhere, no special privileges required. This is the default
-    and the most reliable.
+- TCP connect scan (-sT): normal socket.connect(), no privileges, default.
+- UDP scan (-sU): sends a probe and classifies based on response / ICMP.
+- SYN / half-open scan (-sS): requires scapy + raw-socket privileges;
+  falls back to TCP connect and warns the caller.
 
-  - UDP scan (-sU): sends an (optionally protocol-aware) probe and
-    classifies the port based on whether a response or an ICMP
-    "port unreachable" comes back. UDP scanning is inherently slower
-    and less reliable than TCP -- this is a fundamental protocol
-    limitation, not a bug in this tool.
-
-  - SYN / half-open scan (-sS): only available when scapy is installed
-    AND the process has permission to send raw packets (typically
-    root/Administrator). If either condition isn't met, the engine
-    transparently falls back to a TCP connect scan and surfaces a
-    warning to the caller so the user understands what actually ran.
-
-All three return a uniform ScanResult so the rest of the program
-doesn't need to care which strategy produced it.
+Upgrades over v1:
+  - IPv6 auto-detection (AF_INET6 when host resolves to an IPv6 address).
+  - Configurable per-port retry count for unreliable links.
+  - More precise errno → state mapping (ETIMEDOUT, ENETUNREACH, etc.).
+  - Optional source-port randomisation in SYN scans.
+  - Scan-type preserved correctly on fallback paths.
 """
 
 from __future__ import annotations
 
 import errno
+import random
 import socket
 import time
 from dataclasses import dataclass, field
@@ -33,167 +27,276 @@ from typing import Optional
 
 from .ports_data import get_service_name
 
-# Scapy is optional. Only the SYN scan and (optionally) more detailed
-# OS fingerprinting depend on it; everything else works with the
-# standard library alone.
+# ---------------------------------------------------------------------------
+# Optional scapy import (SYN scan / OS fingerprint only)
+# ---------------------------------------------------------------------------
 try:
-    from scapy.all import IP, TCP, sr1  # type: ignore
+    from scapy.all import IP, IPv6, TCP, sr1  # type: ignore
     SCAPY_AVAILABLE = True
-except Exception:  # pragma: no cover - environment dependent
+except Exception:  # pragma: no cover
     SCAPY_AVAILABLE = False
 
+# ---------------------------------------------------------------------------
+# Port state constants
+# ---------------------------------------------------------------------------
+OPEN           = "open"
+CLOSED         = "closed"
+FILTERED       = "filtered"
+OPEN_FILTERED  = "open|filtered"
+ERROR          = "error"
 
-OPEN = "open"
-CLOSED = "closed"
-FILTERED = "filtered"
-OPEN_FILTERED = "open|filtered"
-ERROR = "error"
+# errno codes that mean the port is definitively closed (connection refused)
+_REFUSED = frozenset({errno.ECONNREFUSED})
+
+# errno codes that indicate the network path is broken / filtered
+_UNREACHABLE = frozenset({
+    getattr(errno, "EHOSTUNREACH", None),
+    getattr(errno, "ENETUNREACH",  None),
+    getattr(errno, "ETIMEDOUT",    None),
+    getattr(errno, "EACCES",       None),   # some BSDs use this for filtered
+})
+_UNREACHABLE -= {None}  # in case an attr doesn't exist on the platform
 
 
 @dataclass
 class ScanResult:
     host: str
     port: int
-    protocol: str           # "tcp" or "udp"
-    state: str               # open / closed / filtered / open|filtered / error
+    protocol: str             # "tcp" or "udp"
+    state: str                # open / closed / filtered / open|filtered / error
     service: str = ""
     banner: str = ""
     response_time_ms: Optional[float] = None
     error: Optional[str] = None
-    scan_type: str = "connect"   # connect / syn / udp
+    scan_type: str = "connect"  # connect / syn / udp / connect-fallback
 
-    def __post_init__(self):
+    def __post_init__(self) -> None:
         if not self.service:
             self.service = get_service_name(self.port)
 
 
+def _resolve_family(host: str) -> int:
+    """Return AF_INET6 if the host resolves to an IPv6 address, else AF_INET."""
+    try:
+        info = socket.getaddrinfo(host, None)
+        for fam, *_ in info:
+            if fam == socket.AF_INET6:
+                return socket.AF_INET6
+    except OSError:
+        pass
+    return socket.AF_INET
+
+
 class ScanEngine:
-    """Holds shared scan configuration and exposes one method per protocol."""
+    """Shared scan configuration and one probe method per protocol."""
 
-    def __init__(self, timeout: float = 1.0, delay: float = 0.0):
+    def __init__(
+        self,
+        timeout: float = 1.0,
+        delay: float = 0.0,
+        retries: int = 0,
+    ) -> None:
         self.timeout = timeout
-        self.delay = delay  # seconds to sleep before each probe (rate limiting)
+        self.delay = delay      # seconds between probes (rate limiting)
+        self.retries = retries  # retry count for TCP connect on timeout
 
-    # ------------------------------------------------------------------ #
+    # ------------------------------------------------------------------
+    # Internal helpers
+    # ------------------------------------------------------------------
+
+    def _sleep(self) -> None:
+        if self.delay:
+            time.sleep(self.delay)
+
+    def _make_tcp_socket(self, family: int) -> socket.socket:
+        sock = socket.socket(family, socket.SOCK_STREAM)
+        sock.settimeout(self.timeout)
+        return sock
+
+    # ------------------------------------------------------------------
     # TCP connect scan
-    # ------------------------------------------------------------------ #
+    # ------------------------------------------------------------------
+
     def tcp_connect_scan(self, host: str, port: int) -> ScanResult:
-        if self.delay:
-            time.sleep(self.delay)
+        self._sleep()
+        family = _resolve_family(host)
+        attempts = max(self.retries, 0) + 1
 
-        start = time.time()
-        sock = socket.socket(socket.AF_INET, socket.SOCK_STREAM)
-        sock.settimeout(self.timeout)
-        try:
-            result_code = sock.connect_ex((host, port))
-            elapsed_ms = (time.time() - start) * 1000
-            if result_code == 0:
-                state = OPEN
-            elif result_code in (errno.ECONNREFUSED,):
-                state = CLOSED
-            else:
-                # timeout, host unreachable, etc -> treated as filtered
-                state = FILTERED
-            return ScanResult(host, port, "tcp", state, response_time_ms=elapsed_ms,
-                               scan_type="connect")
-        except socket.timeout:
-            return ScanResult(host, port, "tcp", FILTERED,
-                               response_time_ms=(time.time() - start) * 1000,
-                               scan_type="connect")
-        except PermissionError as exc:
-            return ScanResult(host, port, "tcp", ERROR, error=f"Permission denied: {exc}")
-        except OSError as exc:
-            return ScanResult(host, port, "tcp", ERROR, error=str(exc))
-        finally:
-            sock.close()
+        for attempt in range(attempts):
+            sock = self._make_tcp_socket(family)
+            start = time.perf_counter()
+            try:
+                rc = sock.connect_ex((host, port))
+                elapsed = (time.perf_counter() - start) * 1000
 
-    # ------------------------------------------------------------------ #
+                if rc == 0:
+                    return ScanResult(
+                        host, port, "tcp", OPEN,
+                        response_time_ms=elapsed, scan_type="connect"
+                    )
+                if rc in _REFUSED:
+                    return ScanResult(
+                        host, port, "tcp", CLOSED,
+                        response_time_ms=elapsed, scan_type="connect"
+                    )
+                if rc in _UNREACHABLE:
+                    # Don't retry on hard network errors
+                    return ScanResult(
+                        host, port, "tcp", FILTERED,
+                        response_time_ms=elapsed, scan_type="connect"
+                    )
+                # Catch-all (EWOULDBLOCK on non-blocking, etc.)
+                if attempt < attempts - 1:
+                    continue
+                return ScanResult(
+                    host, port, "tcp", FILTERED,
+                    response_time_ms=elapsed, scan_type="connect"
+                )
+
+            except socket.timeout:
+                elapsed = (time.perf_counter() - start) * 1000
+                if attempt < attempts - 1:
+                    continue
+                return ScanResult(
+                    host, port, "tcp", FILTERED,
+                    response_time_ms=elapsed, scan_type="connect"
+                )
+            except PermissionError as exc:
+                return ScanResult(
+                    host, port, "tcp", ERROR,
+                    error=f"Permission denied: {exc}", scan_type="connect"
+                )
+            except OSError as exc:
+                err_no = getattr(exc, "errno", None)
+                if err_no in _REFUSED:
+                    return ScanResult(host, port, "tcp", CLOSED, scan_type="connect")
+                return ScanResult(
+                    host, port, "tcp", ERROR,
+                    error=str(exc), scan_type="connect"
+                )
+            finally:
+                sock.close()
+
+        # Should not reach here, but be defensive
+        return ScanResult(host, port, "tcp", FILTERED, scan_type="connect")
+
+    # ------------------------------------------------------------------
     # UDP scan
-    # ------------------------------------------------------------------ #
-    def udp_scan(self, host: str, port: int) -> ScanResult:
-        if self.delay:
-            time.sleep(self.delay)
+    # ------------------------------------------------------------------
 
-        start = time.time()
-        sock = socket.socket(socket.AF_INET, socket.SOCK_DGRAM)
+    def udp_scan(self, host: str, port: int) -> ScanResult:
+        self._sleep()
+        family = _resolve_family(host)
+        sock = socket.socket(family, socket.SOCK_DGRAM)
         sock.settimeout(self.timeout)
+        start = time.perf_counter()
+
         try:
-            # An empty/generic probe is enough to elicit ICMP unreachable
-            # from closed ports on most stacks; service_detection.py
-            # sends smarter, protocol-specific probes for banner grabbing.
+            # Empty probe triggers ICMP port-unreachable on closed UDP ports.
             sock.sendto(b"\x00", (host, port))
             try:
-                data, _ = sock.recvfrom(1024)
-                elapsed_ms = (time.time() - start) * 1000
+                data, _ = sock.recvfrom(2048)
+                elapsed = (time.perf_counter() - start) * 1000
                 banner = data[:256].decode(errors="replace") if data else ""
-                return ScanResult(host, port, "udp", OPEN, banner=banner,
-                                   response_time_ms=elapsed_ms, scan_type="udp")
+                return ScanResult(
+                    host, port, "udp", OPEN,
+                    banner=banner, response_time_ms=elapsed, scan_type="udp"
+                )
             except socket.timeout:
-                # No response at all: could be open (silently dropping our
-                # probe) or filtered by a firewall. UDP can't tell these
-                # apart without a protocol-specific probe, so we report
-                # the standard nmap-style ambiguous state.
-                return ScanResult(host, port, "udp", OPEN_FILTERED,
-                                   response_time_ms=(time.time() - start) * 1000,
-                                   scan_type="udp")
-        except ConnectionResetError:
-            # On some platforms a previous ICMP port-unreachable surfaces
-            # here as a connection reset -- treat it as definitively closed.
-            return ScanResult(host, port, "udp", CLOSED,
-                               response_time_ms=(time.time() - start) * 1000,
-                               scan_type="udp")
+                # No response: open (silently drops probe) OR filtered.
+                return ScanResult(
+                    host, port, "udp", OPEN_FILTERED,
+                    response_time_ms=(time.perf_counter() - start) * 1000,
+                    scan_type="udp"
+                )
+            except ConnectionResetError:
+                # ICMP port-unreachable surfaced as connection reset on Windows.
+                return ScanResult(
+                    host, port, "udp", CLOSED,
+                    response_time_ms=(time.perf_counter() - start) * 1000,
+                    scan_type="udp"
+                )
+            except OSError as exc:
+                err_no = getattr(exc, "errno", None)
+                if err_no in _REFUSED:
+                    return ScanResult(
+                        host, port, "udp", CLOSED,
+                        response_time_ms=(time.perf_counter() - start) * 1000,
+                        scan_type="udp"
+                    )
+                return ScanResult(host, port, "udp", ERROR, error=str(exc), scan_type="udp")
+
         except OSError as exc:
-            # ICMP port unreachable typically raises ECONNREFUSED here
-            if getattr(exc, "errno", None) == errno.ECONNREFUSED:
-                return ScanResult(host, port, "udp", CLOSED,
-                                   response_time_ms=(time.time() - start) * 1000,
-                                   scan_type="udp")
-            return ScanResult(host, port, "udp", ERROR, error=str(exc))
+            return ScanResult(host, port, "udp", ERROR, error=str(exc), scan_type="udp")
         finally:
             sock.close()
 
-    # ------------------------------------------------------------------ #
-    # SYN (half-open) scan -- requires scapy + raw socket privileges
-    # ------------------------------------------------------------------ #
+    # ------------------------------------------------------------------
+    # SYN (half-open) scan — requires scapy + raw socket privileges
+    # ------------------------------------------------------------------
+
     def syn_scan(self, host: str, port: int) -> ScanResult:
         if not SCAPY_AVAILABLE:
             result = self.tcp_connect_scan(host, port)
             result.scan_type = "connect-fallback"
-            result.error = "scapy not installed; fell back to TCP connect scan"
+            result.error = "scapy not installed; fell back to TCP connect"
             return result
 
-        if self.delay:
-            time.sleep(self.delay)
+        self._sleep()
+        start = time.perf_counter()
 
-        start = time.time()
+        # Randomise source port to reduce collision probability on busy hosts.
+        src_port = random.randint(49152, 65535)
+
         try:
-            src_port = 40000 + (port % 20000)
-            pkt = IP(dst=host) / TCP(sport=src_port, dport=port, flags="S")
+            # Detect IPv6 and build the appropriate packet.
+            family = _resolve_family(host)
+            if family == socket.AF_INET6:
+                pkt = IPv6(dst=host) / TCP(sport=src_port, dport=port, flags="S")
+            else:
+                pkt = IP(dst=host) / TCP(sport=src_port, dport=port, flags="S")
+
             resp = sr1(pkt, timeout=self.timeout, verbose=0)
-            elapsed_ms = (time.time() - start) * 1000
+            elapsed = (time.perf_counter() - start) * 1000
 
             if resp is None:
                 return ScanResult(host, port, "tcp", FILTERED,
-                                   response_time_ms=elapsed_ms, scan_type="syn")
+                                  response_time_ms=elapsed, scan_type="syn")
 
             if resp.haslayer(TCP):
                 flags = resp[TCP].flags
-                if flags & 0x12 == 0x12:  # SYN+ACK
-                    # Politely tear down the half-open connection.
-                    rst = IP(dst=host) / TCP(sport=src_port, dport=port, flags="R",
-                                              seq=resp[TCP].ack)
+                if flags & 0x12 == 0x12:  # SYN-ACK → open
+                    # Send RST to cleanly close the half-open connection.
+                    if family == socket.AF_INET6:
+                        rst = IPv6(dst=host) / TCP(
+                            sport=src_port, dport=port, flags="R",
+                            seq=resp[TCP].ack
+                        )
+                    else:
+                        rst = IP(dst=host) / TCP(
+                            sport=src_port, dport=port, flags="R",
+                            seq=resp[TCP].ack
+                        )
                     sr1(rst, timeout=self.timeout, verbose=0)
                     return ScanResult(host, port, "tcp", OPEN,
-                                       response_time_ms=elapsed_ms, scan_type="syn")
-                if flags & 0x14 == 0x14:  # RST+ACK
+                                      response_time_ms=elapsed, scan_type="syn")
+
+                if flags & 0x04:  # RST flag set → closed
                     return ScanResult(host, port, "tcp", CLOSED,
-                                       response_time_ms=elapsed_ms, scan_type="syn")
+                                      response_time_ms=elapsed, scan_type="syn")
+
+            # ICMP unreachable or unexpected packet → filtered
             return ScanResult(host, port, "tcp", FILTERED,
-                               response_time_ms=elapsed_ms, scan_type="syn")
+                              response_time_ms=elapsed, scan_type="syn")
+
         except PermissionError as exc:
             result = self.tcp_connect_scan(host, port)
             result.scan_type = "connect-fallback"
-            result.error = f"SYN scan needs elevated privileges ({exc}); used TCP connect instead"
+            result.error = (
+                f"SYN scan needs elevated privileges ({exc}); "
+                "used TCP connect instead"
+            )
             return result
-        except Exception as exc:  # pragma: no cover - network/env dependent
-            return ScanResult(host, port, "tcp", ERROR, error=str(exc), scan_type="syn")
+        except Exception as exc:  # pragma: no cover
+            return ScanResult(host, port, "tcp", ERROR,
+                              error=str(exc), scan_type="syn")
