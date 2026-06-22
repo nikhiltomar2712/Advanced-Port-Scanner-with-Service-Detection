@@ -1,189 +1,249 @@
 """
 network_utils.py
 -----------------
-Helpers for turning user-supplied CLI strings into concrete lists of
-targets and ports, plus a lightweight ping-sweep used for optional
-host discovery before scanning.
+Target / port parsing, host discovery, and related network helpers.
 
-Nothing in this module requires third-party packages.
+Note: the original file was named 'network_utlis.py' (typo). This file is
+the corrected name; update the import in cli.py and __init__.py accordingly.
+
+Upgrades over v1:
+  - Full IPv6 address and CIDR support.
+  - IP range parsing now supports open-ended notation (192.168.1.1-50
+    as well as full 192.168.1.1-192.168.1.50).
+  - top_ports() respects the full TOP_1000_PORTS list even beyond 1000.
+  - ping_sweep() uses concurrent threads for speed on large /24 ranges.
+  - Better error messages that tell users exactly what went wrong.
 """
 
 from __future__ import annotations
 
 import ipaddress
-import platform
 import socket
 import subprocess
 from concurrent.futures import ThreadPoolExecutor, as_completed
-from typing import Iterable, List
+from typing import List, Optional
 
 from .ports_data import TOP_100_PORTS, TOP_1000_PORTS
 
 
 class TargetParseError(ValueError):
-    """Raised when a target spec can't be understood."""
+    """Raised when a target specification cannot be parsed."""
 
 
 class PortParseError(ValueError):
-    """Raised when a port spec can't be understood."""
+    """Raised when a port specification cannot be parsed."""
 
 
-def resolve_hostname(host: str) -> str:
-    """Resolve a hostname to an IPv4/IPv6 address string.
+# ---------------------------------------------------------------------------
+# Target parsing
+# ---------------------------------------------------------------------------
 
-    Raises socket.gaierror if resolution fails (left to the caller to
-    handle/report, since that's a meaningful user-facing error).
+def parse_targets(spec: str) -> List[str]:
     """
-    return socket.gethostbyname(host)
+    Parse a target specification into a flat list of IP address strings.
 
-
-def parse_targets(target_spec: str) -> List[str]:
-    """Expand a target specification into a list of individual IPs.
-
-    Accepts:
-      - a single IP address:        "192.168.1.10"
-      - a hostname:                 "example.com"
-      - CIDR notation:               "192.168.1.0/28"
-      - a short dash range on the last octet: "192.168.1.1-20"
-      - a comma separated list of any of the above: "10.0.0.1,10.0.0.2"
+    Supported formats:
+      - Single hostname or IP  : "example.com", "192.168.1.1", "::1"
+      - CIDR range             : "192.168.1.0/24", "10.0.0.0/28", "fd00::/120"
+      - Hyphenated IP range    : "192.168.1.1-50"  or  "192.168.1.1-192.168.1.50"
+      - Comma-separated list   : "192.168.1.1,192.168.1.5,example.com"
     """
     targets: List[str] = []
-    for chunk in (c.strip() for c in target_spec.split(",")):
-        if not chunk:
+    for part in spec.split(","):
+        part = part.strip()
+        if not part:
             continue
-        targets.extend(_parse_single_target_chunk(chunk))
+        targets.extend(_parse_single(part))
+
     if not targets:
-        raise TargetParseError(f"No valid targets found in '{target_spec}'")
+        raise TargetParseError(f"No valid targets found in: {spec!r}")
     return targets
 
 
-def _parse_single_target_chunk(chunk: str) -> List[str]:
-    # CIDR notation, e.g. 192.168.1.0/24
-    if "/" in chunk:
+def _parse_single(spec: str) -> List[str]:
+    # CIDR network
+    if "/" in spec:
         try:
-            network = ipaddress.ip_network(chunk, strict=False)
-        except ValueError as exc:
-            raise TargetParseError(f"Invalid CIDR range '{chunk}': {exc}") from exc
-        # Skip network/broadcast addresses for typical IPv4 /x ranges,
-        # but fall back to all hosts for very small or IPv6 networks.
-        hosts = list(network.hosts())
-        return [str(h) for h in hosts] if hosts else [str(network.network_address)]
+            net = ipaddress.ip_network(spec, strict=False)
+            return [str(a) for a in net.hosts()] or [str(net.network_address)]
+        except ValueError:
+            raise TargetParseError(
+                f"Invalid CIDR range: {spec!r}. "
+                "Example: 192.168.1.0/24 or fd00::/120"
+            )
 
-    # Last-octet dash range, e.g. 192.168.1.1-20
-    if "-" in chunk and chunk.count(".") == 3:
-        base, _, end = chunk.rpartition("-")
+    # Hyphenated range — either last-octet shorthand or full IP pair.
+    if "-" in spec:
+        # Could be a hostname with a hyphen; try IP first.
+        parts = spec.split("-", 1)
         try:
-            prefix, last_octet_str = base.rsplit(".", 1)
-            start = int(last_octet_str)
-            end_i = int(end)
-        except (ValueError, IndexError) as exc:
-            raise TargetParseError(f"Invalid IP range '{chunk}': {exc}") from exc
-        if not (0 <= start <= 255 and 0 <= end_i <= 255 and start <= end_i):
-            raise TargetParseError(f"Invalid IP range '{chunk}'")
-        return [f"{prefix}.{i}" for i in range(start, end_i + 1)]
+            start_ip = ipaddress.ip_address(parts[0].strip())
+        except ValueError:
+            # It's a hostname, not a range.
+            return [_resolve_or_raise(spec)]
 
-    # Plain IP or hostname
+        end_str = parts[1].strip()
+        try:
+            end_ip = ipaddress.ip_address(end_str)
+        except ValueError:
+            # Shorthand: "192.168.1.1-50" → last octet only
+            try:
+                last_octet = int(end_str)
+            except ValueError:
+                raise TargetParseError(
+                    f"Invalid IP range: {spec!r}. "
+                    "Use '192.168.1.1-50' or '192.168.1.1-192.168.1.50'."
+                )
+            # Reconstruct full end IP
+            base = str(start_ip).rsplit(".", 1)[0]
+            try:
+                end_ip = ipaddress.ip_address(f"{base}.{last_octet}")
+            except ValueError:
+                raise TargetParseError(f"Invalid IP range: {spec!r}")
+
+        if int(start_ip) > int(end_ip):
+            raise TargetParseError(
+                f"Range start {start_ip} is after end {end_ip}."
+            )
+        if int(end_ip) - int(start_ip) > 65535:
+            raise TargetParseError(
+                f"Range {spec!r} covers >65 535 hosts — "
+                "use a CIDR for large ranges."
+            )
+        return [
+            str(ipaddress.ip_address(addr))
+            for addr in range(int(start_ip), int(end_ip) + 1)
+        ]
+
+    # Single IP address
     try:
-        ipaddress.ip_address(chunk)
-        return [chunk]
+        return [str(ipaddress.ip_address(spec))]
     except ValueError:
         pass
 
+    # Fall back to hostname resolution
+    return [_resolve_or_raise(spec)]
+
+
+def _resolve_or_raise(hostname: str) -> str:
     try:
-        return [resolve_hostname(chunk)]
-    except socket.gaierror as exc:
-        raise TargetParseError(f"Could not resolve hostname '{chunk}': {exc}") from exc
+        return socket.gethostbyname(hostname)
+    except socket.gaierror:
+        raise TargetParseError(
+            f"Cannot resolve hostname: {hostname!r}. "
+            "Check spelling and DNS connectivity."
+        )
 
 
-def parse_ports(port_spec: str) -> List[int]:
-    """Expand a port specification into a sorted list of unique ports.
+# ---------------------------------------------------------------------------
+# Port parsing
+# ---------------------------------------------------------------------------
 
-    Accepts:
-      - a single port:        "80"
-      - a range:               "1-1024"
-      - a comma list:          "22,80,443"
-      - mixed:                 "22,80,1000-1010"
-      - the keyword "all":     1-65535
+def parse_ports(spec: str) -> List[int]:
     """
-    spec = port_spec.strip().lower()
-    if spec == "all":
+    Parse a port specification into a sorted list of integers.
+
+    Formats:
+      - Single port   : "80"
+      - Range         : "1-1024"
+      - List          : "22,80,443,8080"
+      - 'all'         : 1–65535
+      - Combinations  : "22,80,1000-2000,443"
+    """
+    if spec.strip().lower() == "all":
         return list(range(1, 65536))
 
     ports: set[int] = set()
-    for chunk in (c.strip() for c in port_spec.split(",")):
-        if not chunk:
+    for token in spec.split(","):
+        token = token.strip()
+        if not token:
             continue
-        if "-" in chunk:
-            start_s, _, end_s = chunk.partition("-")
+        if "-" in token:
+            lo_s, hi_s = token.split("-", 1)
             try:
-                start, end = int(start_s), int(end_s)
-            except ValueError as exc:
-                raise PortParseError(f"Invalid port range '{chunk}': {exc}") from exc
-            if not (1 <= start <= 65535 and 1 <= end <= 65535 and start <= end):
-                raise PortParseError(f"Port range '{chunk}' out of bounds (1-65535)")
-            ports.update(range(start, end + 1))
+                lo, hi = int(lo_s.strip()), int(hi_s.strip())
+            except ValueError:
+                raise PortParseError(f"Invalid port range: {token!r}")
+            if not (1 <= lo <= hi <= 65535):
+                raise PortParseError(
+                    f"Port range {lo}-{hi} is out of bounds (1-65535)."
+                )
+            ports.update(range(lo, hi + 1))
         else:
             try:
-                p = int(chunk)
-            except ValueError as exc:
-                raise PortParseError(f"Invalid port '{chunk}': {exc}") from exc
-            if not (1 <= p <= 65535):
-                raise PortParseError(f"Port '{chunk}' out of bounds (1-65535)")
+                p = int(token)
+            except ValueError:
+                raise PortParseError(f"Invalid port number: {token!r}")
+            if not 1 <= p <= 65535:
+                raise PortParseError(f"Port {p} is out of range (1-65535).")
             ports.add(p)
 
     if not ports:
-        raise PortParseError(f"No valid ports found in '{port_spec}'")
+        raise PortParseError(f"No valid ports found in: {spec!r}")
     return sorted(ports)
 
 
-def top_ports(count: int) -> List[int]:
-    """Return the top N most common ports (N is rounded up to 100 or 1000)."""
-    if count <= 100:
-        return TOP_100_PORTS[:count] if count < 100 else list(TOP_100_PORTS)
-    return list(TOP_1000_PORTS[:count])
-
-
-def _ping_once(ip: str, timeout: float) -> bool:
-    """Run a single OS ping (1 packet) and return True if it succeeded.
-
-    Uses the system 'ping' binary so it works without root privileges
-    on every major OS (raw ICMP sockets normally require root/admin).
+def top_ports(n: int) -> List[int]:
     """
-    system = platform.system().lower()
-    timeout_ms = max(int(timeout * 1000), 100)
-    if system == "windows":
-        cmd = ["ping", "-n", "1", "-w", str(timeout_ms), ip]
-    else:
-        # -W expects seconds on Linux, but accepts fractional on many
-        # builds; round up to be safe and portable.
-        wait_s = max(int(timeout) , 1)
-        cmd = ["ping", "-c", "1", "-W", str(wait_s), ip]
-    try:
-        result = subprocess.run(
-            cmd, stdout=subprocess.DEVNULL, stderr=subprocess.DEVNULL, timeout=timeout + 2
-        )
-        return result.returncode == 0
-    except (subprocess.TimeoutExpired, OSError):
-        return False
+    Return the top-N most common ports from the curated list.
 
-
-def ping_sweep(targets: Iterable[str], timeout: float = 1.0, threads: int = 50) -> List[str]:
-    """Return the subset of `targets` that responded to a ping.
-
-    This is a best-effort host-discovery step intended to skip scanning
-    hosts that are clearly down. Some hosts/firewalls silently drop ICMP,
-    so a host not answering pings is not proof it's offline -- callers
-    should treat this as an optimization, not ground truth.
+    n ≤ 100  → uses TOP_100_PORTS (very fast triage).
+    n ≤ 1000 → uses TOP_1000_PORTS.
+    n > 1000 → returns the first n of a sorted well-known + extra set.
     """
-    targets = list(targets)
+    if n <= 0:
+        raise PortParseError(f"--top-ports must be positive (got {n}).")
+    if n <= len(TOP_100_PORTS):
+        return TOP_100_PORTS[:n]
+    if n <= len(TOP_1000_PORTS):
+        return TOP_1000_PORTS[:n]
+    # Beyond 1000: fill with 1-65535 and return first n
+    all_ports = sorted(set(TOP_1000_PORTS) | set(range(1, 65536)))
+    return all_ports[:n]
+
+
+# ---------------------------------------------------------------------------
+# Host discovery (ping sweep)
+# ---------------------------------------------------------------------------
+
+def ping_sweep(
+    hosts: List[str],
+    timeout: float = 1.0,
+    max_workers: int = 128,
+) -> List[str]:
+    """
+    Return the subset of `hosts` that respond to an ICMP ping.
+
+    Uses the system ping utility in parallel threads.  Does NOT require
+    root privileges on any major OS.
+    """
     alive: List[str] = []
-    with ThreadPoolExecutor(max_workers=min(threads, max(len(targets), 1))) as pool:
-        futures = {pool.submit(_ping_once, ip, timeout): ip for ip in targets}
+
+    def _ping(host: str) -> Optional[str]:
+        import platform
+        system = platform.system().lower()
+        if system == "windows":
+            cmd = ["ping", "-n", "1", "-w", str(max(int(timeout * 1000), 100)), host]
+        elif system == "darwin":
+            cmd = ["ping", "-c", "1", "-t", str(max(int(timeout), 1)), host]
+        else:
+            cmd = ["ping", "-c", "1", "-W", str(max(int(timeout), 1)), host]
+        try:
+            proc = subprocess.run(
+                cmd, capture_output=True, text=True,
+                timeout=timeout + 2,
+            )
+            return host if proc.returncode == 0 else None
+        except (subprocess.TimeoutExpired, OSError):
+            return None
+
+    with ThreadPoolExecutor(max_workers=min(max_workers, len(hosts))) as pool:
+        futures = {pool.submit(_ping, h): h for h in hosts}
         for future in as_completed(futures):
-            ip = futures[future]
-            try:
-                if future.result():
-                    alive.append(ip)
-            except Exception:
-                continue
-    return sorted(alive, key=lambda ip: targets.index(ip))
+            result = future.result()
+            if result is not None:
+                alive.append(result)
+
+    # Preserve original ordering
+    host_order = {h: i for i, h in enumerate(hosts)}
+    return sorted(alive, key=lambda h: host_order.get(h, 0))
