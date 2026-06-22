@@ -1,0 +1,14 @@
+# Advanced Port Scanner — Python dependencies
+# All stdlib; no required third-party packages.
+#
+# Optional — install for additional features:
+#
+#   scapy           SYN scan (-sS) and TCP window-based OS fingerprinting
+#
+# pip install scapy
+#
+# Note: SYN scans and OS TCP-window probes additionally require the
+# process to run with elevated privileges (root on Linux/macOS,
+# Administrator on Windows).
+
+# scapy>=2.5.0  # uncomment to pin for reproducible installs
